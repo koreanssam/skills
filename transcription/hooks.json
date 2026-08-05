@@ -1,0 +1,42 @@
+{
+  "transcription-page-verifier": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 skills/transcription/scripts/transcription_hook.py pre-tool",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "view_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 skills/transcription/scripts/transcription_hook.py post-tool",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 skills/transcription/scripts/transcription_hook.py pre-invocation",
+        "timeout": 10
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 skills/transcription/scripts/transcription_hook.py stop",
+        "timeout": 10
+      }
+    ]
+  }
+}
