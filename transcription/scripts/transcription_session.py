@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -47,7 +48,43 @@ def ensure_pdf(path: Path) -> None:
             raise SystemExit(f"Not a PDF file: {path}")
 
 
-def render_pages(pdf: Path, page_dir: Path, dpi: int) -> list[Path]:
+def pdf_page_count(pdf: Path) -> int:
+    executable = shutil.which("pdfinfo")
+    if not executable:
+        raise SystemExit("pdfinfo is required to validate PDF page selection")
+    process = subprocess.run(
+        [executable, str(pdf)], text=True, capture_output=True, check=False
+    )
+    if process.returncode:
+        raise SystemExit(f"pdfinfo failed: {process.stderr.strip()}")
+    match = re.search(r"(?m)^Pages:\s+(\d+)\s*$", process.stdout)
+    if not match:
+        raise SystemExit("Could not determine PDF page count")
+    return int(match.group(1))
+
+
+def parse_pages(spec: str | None, total: int) -> list[int]:
+    if not spec:
+        return list(range(1, total + 1))
+    selected: set[int] = set()
+    for item in spec.split(","):
+        item = item.strip()
+        match = re.fullmatch(r"(\d+)(?:-(\d+))?", item)
+        if not match:
+            raise SystemExit(f"Invalid --pages item: {item!r}")
+        first = int(match.group(1))
+        last = int(match.group(2) or first)
+        if first > last or first < 1 or last > total:
+            raise SystemExit(f"Page range outside 1-{total}: {item}")
+        selected.update(range(first, last + 1))
+    if not selected:
+        raise SystemExit("--pages selected no pages")
+    return sorted(selected)
+
+
+def render_pages(
+    pdf: Path, page_dir: Path, dpi: int, selected: list[int], total: int
+) -> list[Path]:
     executable = shutil.which("pdftoppm")
     if not executable:
         raise SystemExit(
@@ -55,15 +92,31 @@ def render_pages(pdf: Path, page_dir: Path, dpi: int) -> list[Path]:
             "Install Poppler, then retry."
         )
     page_dir.mkdir(parents=True, exist_ok=False)
-    prefix = page_dir / "page"
-    process = subprocess.run(
-        [executable, "-png", "-r", str(dpi), str(pdf), str(prefix)],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if process.returncode:
-        raise SystemExit(f"pdftoppm failed: {process.stderr.strip()}")
+    if selected == list(range(1, total + 1)):
+        commands = [
+            [executable, "-png", "-r", str(dpi), str(pdf), str(page_dir / "page")]
+        ]
+    else:
+        commands = [
+            [
+                executable,
+                "-png",
+                "-r",
+                str(dpi),
+                "-f",
+                str(number),
+                "-l",
+                str(number),
+                "-singlefile",
+                str(pdf),
+                str(page_dir / f"page-{number:04d}"),
+            ]
+            for number in selected
+        ]
+    for command in commands:
+        process = subprocess.run(command, text=True, capture_output=True, check=False)
+        if process.returncode:
+            raise SystemExit(f"pdftoppm failed: {process.stderr.strip()}")
     pages = sorted(page_dir.glob("page-*.png"), key=page_number)
     if not pages:
         raise SystemExit("PDF rendering produced no pages")
@@ -87,47 +140,69 @@ def start(args: argparse.Namespace) -> int:
     if not (72 <= args.dpi <= 600):
         raise SystemExit("--dpi must be between 72 and 600")
 
-    manifest_path = workspace / STATE_DIR / MANIFEST_NAME
-    if manifest_path.exists():
-        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if previous.get("active"):
-            raise SystemExit(
-                f"An active session already exists for {previous.get('sourcePdf')}. "
-                "Finish it before starting another."
-            )
+    state_root = workspace / STATE_DIR
+    state_root.mkdir(parents=True, exist_ok=True)
+    manifest_path = state_root / MANIFEST_NAME
+    lock_path = state_root / "start.lock"
 
-    source_hash = digest(pdf)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    session_dir = workspace / STATE_DIR / "sessions" / f"{stamp}-{source_hash[:12]}"
-    pages = render_pages(pdf, session_dir / "pages", args.dpi)
-    expected = list(range(1, len(pages) + 1))
-    actual = [page_number(path) for path in pages]
-    if actual != expected:
-        raise SystemExit(f"Rendered pages are not contiguous: {actual}")
+    # Hold the lock through rendering. A second start waits, then sees the active
+    # manifest instead of rendering a competing set of pages.
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if manifest_path.exists():
+            previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if previous.get("active"):
+                raise SystemExit(
+                    f"An active session already exists for {previous.get('sourcePdf')}. "
+                    "Finish it before starting another."
+                )
 
-    manifest = {
-        "version": 1,
-        "active": True,
-        "createdAt": datetime.now(timezone.utc).isoformat(),
-        "conversationId": None,
-        "sourcePdf": str(pdf),
-        "sourceSha256": source_hash,
-        "outputPath": str(output),
-        "pageCount": len(pages),
-        "pages": [
-            {
-                "number": number,
-                "imagePath": str(path.resolve()),
-                "imageSha256": digest(path),
-                "viewed": False,
-                "viewedStepIdx": None,
-            }
-            for number, path in enumerate(pages, 1)
-        ],
-        "pendingViews": {},
-    }
-    write_json_atomic(manifest_path, manifest)
-    print(f"Started guarded transcription: {pdf}")
+        source_hash = digest(pdf)
+        total_pages = pdf_page_count(pdf)
+        selected_pages = parse_pages(args.pages, total_pages)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        session_dir = state_root / "sessions" / f"{stamp}-{source_hash[:12]}"
+        pages = render_pages(
+            pdf, session_dir / "pages", args.dpi, selected_pages, total_pages
+        )
+        expected = selected_pages
+        actual = [page_number(path) for path in pages]
+        if actual != expected:
+            raise SystemExit(f"Rendered pages are not contiguous: {actual}")
+        draft_dir = session_dir / "drafts"
+        draft_dir.mkdir()
+
+        manifest = {
+            "version": 2,
+            "active": True,
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+            "conversationId": None,
+            "sourcePdf": str(pdf),
+            "sourceSha256": source_hash,
+            "outputPath": str(output),
+            "pageCount": len(pages),
+            "sourcePageCount": total_pages,
+            "selectedPages": selected_pages,
+            "pages": [
+                {
+                    "number": number,
+                    "imagePath": str(page.resolve()),
+                    "imageSha256": digest(page),
+                    "draftPath": str((draft_dir / f"page-{number:04d}.txt").resolve()),
+                    "draftSha256": None,
+                    "viewed": False,
+                    "viewedStepIdx": None,
+                    "transcribed": False,
+                    "transcribedStepIdx": None,
+                }
+                for number, page in zip(selected_pages, pages, strict=True)
+            ],
+            "pendingViews": {},
+            "pendingDrafts": {},
+        }
+        write_json_atomic(manifest_path, manifest)
+
+    print(f"Started guarded literal transcription: {pdf}")
     print(f"Pages: {len(pages)}")
     print(f"Output: {output}")
     print(f"Next view_file path: {pages[0].resolve()}")
@@ -140,14 +215,31 @@ def status(args: argparse.Namespace) -> int:
         print("No transcription session")
         return 1
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    viewed = sum(bool(page["viewed"]) for page in manifest["pages"])
+    viewed = sum(bool(page.get("viewed")) for page in manifest.get("pages", []))
+    transcribed = sum(
+        bool(page.get("transcribed")) for page in manifest.get("pages", [])
+    )
     print(f"Active: {manifest.get('active', False)}")
     print(f"Source: {manifest['sourcePdf']}")
     print(f"Viewed: {viewed}/{manifest['pageCount']}")
+    print(f"Transcribed: {transcribed}/{manifest['pageCount']}")
     print(f"Output: {manifest['outputPath']}")
-    next_page = next((page for page in manifest["pages"] if not page["viewed"]), None)
-    if next_page:
-        print(f"Next view_file path: {next_page['imagePath']}")
+    pending = next(
+        (
+            page
+            for page in manifest.get("pages", [])
+            if page.get("viewed") and not page.get("transcribed")
+        ),
+        None,
+    )
+    if pending:
+        print(f"Write literal page draft: {pending['draftPath']}")
+    else:
+        next_page = next(
+            (page for page in manifest.get("pages", []) if not page.get("viewed")), None
+        )
+        if next_page:
+            print(f"Next view_file path: {next_page['imagePath']}")
     return 0
 
 
@@ -158,7 +250,10 @@ def main() -> int:
     start_parser = subparsers.add_parser("start")
     start_parser.add_argument("--pdf", type=Path, required=True)
     start_parser.add_argument("--output", type=Path, required=True)
-    start_parser.add_argument("--dpi", type=int, default=220)
+    start_parser.add_argument("--dpi", type=int, default=300)
+    start_parser.add_argument(
+        "--pages", help="optional source pages, for example 7-8,11"
+    )
     subparsers.add_parser("status")
     args = parser.parse_args()
     return start(args) if args.command == "start" else status(args)

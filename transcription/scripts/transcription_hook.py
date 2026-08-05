@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Antigravity lifecycle hook enforcing direct view_file coverage for every PDF page."""
+"""Enforce immediate, literal, page-by-page visual transcription."""
 
 from __future__ import annotations
 
@@ -51,7 +51,8 @@ def manifest_for(payload: dict[str, Any]) -> tuple[Path | None, dict[str, Any] |
     return None, None
 
 
-def save(path: Path, value: dict[str, Any]) -> None:
+def save_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -63,17 +64,26 @@ def save(path: Path, value: dict[str, Any]) -> None:
         raise
 
 
-def claim_conversation(
-    path: Path, manifest: dict[str, Any], payload: dict[str, Any]
-) -> str | None:
-    conversation_id = payload.get("conversationId")
-    claimed = manifest.get("conversationId")
-    if claimed and conversation_id and claimed != conversation_id:
-        return f"Transcription session belongs to another conversation: {claimed}"
-    if conversation_id and not claimed:
-        manifest["conversationId"] = conversation_id
-        save(path, manifest)
-    return None
+def write_text_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(content)
+        os.replace(temporary_name, path)
+    except BaseException:
+        Path(temporary_name).unlink(missing_ok=True)
+        raise
+
+
+def neutral(event: str) -> int:
+    if event == "pre-tool":
+        return emit({"decision": "allow"})
+    if event == "pre-invocation":
+        return emit({"injectSteps": []})
+    if event == "stop":
+        return emit({"decision": "allow"})
+    return emit({})
 
 
 def tool_name(payload: dict[str, Any]) -> str:
@@ -95,44 +105,78 @@ def first_arg(args: dict[str, Any], *names: str) -> str | None:
 
 
 def next_page(manifest: dict[str, Any]) -> dict[str, Any] | None:
-    return next((page for page in manifest["pages"] if not page["viewed"]), None)
+    return next((page for page in manifest["pages"] if not page.get("viewed")), None)
+
+
+def pending_transcription(manifest: dict[str, Any]) -> dict[str, Any] | None:
+    return next(
+        (
+            page
+            for page in manifest["pages"]
+            if page.get("viewed") and not page.get("transcribed")
+        ),
+        None,
+    )
+
+
+def page_by_number(manifest: dict[str, Any], number: int) -> dict[str, Any]:
+    return next(page for page in manifest["pages"] if page["number"] == number)
+
+
+def compose_output(manifest: dict[str, Any]) -> str:
+    sections = ["# 전사문"]
+    for page in manifest["pages"]:
+        if not page.get("transcribed"):
+            break
+        draft = Path(page["draftPath"]).read_text(encoding="utf-8").rstrip("\n")
+        sections.append(f"## Page {page['number']}\n\n{draft}")
+    return "\n\n".join(sections) + "\n"
+
+
+def validate_draft(page: dict[str, Any]) -> str | None:
+    draft = Path(page["draftPath"])
+    if not draft.is_file():
+        return f"Page draft was not created: {draft}"
+    try:
+        content = draft.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return f"Page draft must be UTF-8 text: {draft}"
+    stripped = content.strip()
+    if not stripped:
+        return "Page draft is empty. Use [빈 페이지] only after visually confirming a blank page."
+    if re.search(r"(?m)^## Page \d+\s*$", content):
+        return "Write only the literal page text; the hook adds page headings automatically."
+    return None
 
 
 def pre_tool(path: Path, manifest: dict[str, Any], payload: dict[str, Any]) -> int:
-    error = claim_conversation(path, manifest, payload)
-    if error:
-        return emit({"decision": "deny", "reason": error})
     name = tool_name(payload)
     args = tool_args(payload)
-
-    if name == "run_command":
-        return emit(
-            {
-                "decision": "deny",
-                "reason": (
-                    "Shell commands are disabled during the guarded transcription. "
-                    "Use only the required view_file calls, then write the registered output."
-                ),
-            }
-        )
+    pending = pending_transcription(manifest)
 
     if name == "view_file":
-        page = next_page(manifest)
-        if page is None:
+        if manifest.get("pendingViews"):
             return emit(
                 {
                     "decision": "deny",
-                    "reason": "All pages are already viewed; write the registered transcript output.",
+                    "reason": "Wait for the current view_file result before another tool call.",
                 }
+            )
+        page = pending or next_page(manifest)
+        if page is None:
+            return emit(
+                {"decision": "deny", "reason": "Every page is already transcribed."}
             )
         requested = first_arg(args, "AbsolutePath", "path", "filePath")
         expected = Path(page["imagePath"]).resolve()
         if not requested or Path(requested).expanduser().resolve() != expected:
+            action = (
+                "Re-open the current page"
+                if pending
+                else f"View page {page['number']} next"
+            )
             return emit(
-                {
-                    "decision": "deny",
-                    "reason": f"View page {page['number']} next with view_file: {expected}",
-                }
+                {"decision": "deny", "reason": f"{action} with view_file: {expected}"}
             )
         if not expected.is_file() or digest(expected) != page["imageSha256"]:
             return emit(
@@ -141,81 +185,138 @@ def pre_tool(path: Path, manifest: dict[str, Any], payload: dict[str, Any]) -> i
                     "reason": "Rendered page identity changed. Start a new transcription session.",
                 }
             )
-        step_key = str(payload.get("stepIdx"))
-        manifest.setdefault("pendingViews", {})[step_key] = page["number"]
-        save(path, manifest)
+        if payload.get("stepIdx") is None:
+            return emit(
+                {"decision": "deny", "reason": "Missing hook stepIdx for page view."}
+            )
+        manifest.setdefault("pendingViews", {})[str(payload["stepIdx"])] = page[
+            "number"
+        ]
+        save_json(path, manifest)
         return emit({"decision": "allow"})
 
     if name in WRITE_TOOLS:
-        page = next_page(manifest)
-        if page is not None:
+        if pending is None:
+            page = next_page(manifest)
+            reason = (
+                f"View page {page['number']} before writing its draft."
+                if page
+                else "Every page is already transcribed; the output was assembled automatically."
+            )
+            return emit({"decision": "deny", "reason": reason})
+        if name != "write_to_file":
             return emit(
                 {
                     "decision": "deny",
-                    "reason": f"Page {page['number']} has not been viewed with view_file yet.",
+                    "reason": "Use write_to_file for the current page draft; do not edit prior pages.",
+                }
+            )
+        if manifest.get("pendingDrafts"):
+            return emit(
+                {
+                    "decision": "deny",
+                    "reason": "Wait for the current page-draft write result.",
                 }
             )
         target = first_arg(args, "TargetFile", "AbsolutePath", "path", "filePath")
-        expected_output = Path(manifest["outputPath"]).resolve()
-        if not target or Path(target).expanduser().resolve() != expected_output:
+        expected = Path(pending["draftPath"]).resolve()
+        if not target or Path(target).expanduser().resolve() != expected:
             return emit(
                 {
                     "decision": "deny",
-                    "reason": f"Write only the registered transcript output: {expected_output}",
+                    "reason": (
+                        f"Immediately write only what is visibly present on page {pending['number']} "
+                        f"to {expected}. Preserve bullets, arrows, corrections, and line breaks."
+                    ),
                 }
             )
+        if payload.get("stepIdx") is None:
+            return emit(
+                {"decision": "deny", "reason": "Missing hook stepIdx for draft write."}
+            )
+        manifest.setdefault("pendingDrafts", {})[str(payload["stepIdx"])] = pending[
+            "number"
+        ]
+        save_json(path, manifest)
         return emit({"decision": "allow"})
 
-    return emit(
-        {
-            "decision": "deny",
-            "reason": (
-                f"Tool {name or '(unknown)'} is disabled during guarded transcription. "
-                "Only the required view_file calls and the registered output write are allowed."
-            ),
-        }
+    reason = (
+        f"Page {pending['number']} must be transcribed immediately to {pending['draftPath']}."
+        if pending
+        else "Only the required page view_file call is allowed now."
     )
+    return emit({"decision": "deny", "reason": reason})
 
 
 def post_tool(path: Path, manifest: dict[str, Any], payload: dict[str, Any]) -> int:
     step_key = str(payload.get("stepIdx"))
     page_number = manifest.setdefault("pendingViews", {}).pop(step_key, None)
     if page_number is not None and not payload.get("error"):
-        page = manifest["pages"][int(page_number) - 1]
+        page = page_by_number(manifest, int(page_number))
         page["viewed"] = True
         page["viewedStepIdx"] = payload.get("stepIdx")
         page["viewedAt"] = datetime.now(timezone.utc).isoformat()
-    save(path, manifest)
+
+    draft_number = manifest.setdefault("pendingDrafts", {}).pop(step_key, None)
+    if draft_number is not None and not payload.get("error"):
+        page = page_by_number(manifest, int(draft_number))
+        error = validate_draft(page)
+        if error:
+            page["draftError"] = error
+        else:
+            page.pop("draftError", None)
+            page["draftSha256"] = digest(Path(page["draftPath"]))
+            page["transcribed"] = True
+            page["transcribedStepIdx"] = payload.get("stepIdx")
+            page["transcribedAt"] = datetime.now(timezone.utc).isoformat()
+            write_text_atomic(Path(manifest["outputPath"]), compose_output(manifest))
+    save_json(path, manifest)
     return emit({})
 
 
 def pre_invocation(manifest: dict[str, Any]) -> int:
-    page = next_page(manifest)
-    if page:
+    pending = pending_transcription(manifest)
+    if pending:
+        prior_error = pending.get("draftError")
         message = (
-            f"Guarded transcription: page {page['number']} of {manifest['pageCount']} must be "
-            f"visually inspected next. Call view_file with AbsolutePath={page['imagePath']}. "
-            "Read only the visible handwriting; never guess or use OCR."
+            f"Page {pending['number']} of {manifest['pageCount']} was just viewed. Before any "
+            f"other page, use write_to_file on {pending['draftPath']}. Transcribe only visible "
+            "marks in top-to-bottom order. Preserve each bullet, arrow, line break, misspelling, "
+            "and correction. Do not summarize, polish, complete, explain, or infer. Use "
+            "[판독 불가] for any unreadable span. Re-open this same image with view_file if needed."
         )
+        if prior_error:
+            message += f" Previous draft was rejected: {prior_error}"
     else:
-        message = (
-            "Every page has a successful view_file call. Write the faithful transcript now to "
-            f"{manifest['outputPath']} with headings ## Page 1 through "
-            f"## Page {manifest['pageCount']}."
-        )
+        page = next_page(manifest)
+        if page:
+            message = (
+                f"View page {page['number']} of {manifest['pageCount']} now with view_file: "
+                f"{page['imagePath']}. Inspect the actual pixels; do not recall or predict text."
+            )
+        else:
+            message = "Every page was viewed and immediately transcribed. The output is complete."
     return emit({"injectSteps": [{"ephemeralMessage": message}]})
 
 
 def stop(path: Path, manifest: dict[str, Any]) -> int:
+    pending = pending_transcription(manifest)
+    if pending:
+        return emit(
+            {
+                "decision": "continue",
+                "reason": (
+                    f"Cannot finish: transcribe the just-viewed page {pending['number']} to "
+                    f"{pending['draftPath']} before proceeding."
+                ),
+            }
+        )
     page = next_page(manifest)
     if page:
         return emit(
             {
                 "decision": "continue",
-                "reason": (
-                    f"Cannot finish: page {page['number']} of {manifest['pageCount']} still needs "
-                    f"a successful view_file call for {page['imagePath']}."
-                ),
+                "reason": f"Cannot finish: page {page['number']} still needs view_file inspection.",
             }
         )
     source = Path(manifest["sourcePdf"])
@@ -226,79 +327,70 @@ def stop(path: Path, manifest: dict[str, Any]) -> int:
                 "reason": "The source PDF changed during transcription. Start a new session.",
             }
         )
+    for page in manifest["pages"]:
+        image_path = Path(page["imagePath"])
+        if not image_path.is_file() or digest(image_path) != page["imageSha256"]:
+            return emit(
+                {
+                    "decision": "continue",
+                    "reason": f"Rendered image for page {page['number']} changed unexpectedly.",
+                }
+            )
+        draft = Path(page["draftPath"])
+        if not draft.is_file() or digest(draft) != page.get("draftSha256"):
+            return emit(
+                {
+                    "decision": "continue",
+                    "reason": f"Completed page {page['number']} draft was changed unexpectedly.",
+                }
+            )
+    expected_output = compose_output(manifest)
     output = Path(manifest["outputPath"])
-    if not output.is_file() or output.stat().st_size == 0:
-        return emit(
-            {
-                "decision": "continue",
-                "reason": f"Cannot finish: write the transcript to {output}.",
-            }
-        )
     try:
-        content = output.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
+        actual_output = output.read_text(encoding="utf-8")
+    except (FileNotFoundError, UnicodeDecodeError):
+        actual_output = ""
+    if actual_output != expected_output:
+        write_text_atomic(output, expected_output)
         return emit(
             {
                 "decision": "continue",
-                "reason": f"Cannot finish: transcript output is not valid UTF-8 text: {output}",
-            }
-        )
-    headings = [int(value) for value in re.findall(r"(?m)^## Page (\d+)\s*$", content)]
-    expected_headings = list(range(1, manifest["pageCount"] + 1))
-    if headings != expected_headings:
-        return emit(
-            {
-                "decision": "continue",
-                "reason": (
-                    "Cannot finish: page headings must occur exactly once and in order. "
-                    f"Expected {expected_headings}; found {headings}."
-                ),
+                "reason": "The hook restored the literal output from immutable page drafts.",
             }
         )
     manifest["active"] = False
     manifest["completedAt"] = datetime.now(timezone.utc).isoformat()
-    save(path, manifest)
+    save_json(path, manifest)
     return emit({"decision": "allow"})
 
 
 def main() -> int:
-    if len(sys.argv) != 2 or sys.argv[1] not in {
-        "pre-tool",
-        "post-tool",
-        "pre-invocation",
-        "stop",
-    }:
+    events = {"pre-tool", "post-tool", "pre-invocation", "stop"}
+    if len(sys.argv) != 2 or sys.argv[1] not in events:
         raise SystemExit(
             "Usage: transcription_hook.py pre-tool|post-tool|pre-invocation|stop"
         )
+    event = sys.argv[1]
     payload = load_input()
     path, manifest = manifest_for(payload)
     if path is None or manifest is None:
-        if sys.argv[1] == "pre-tool":
-            return emit({"decision": "allow"})
-        if sys.argv[1] == "pre-invocation":
-            return emit({"injectSteps": []})
-        if sys.argv[1] == "stop":
-            return emit({"decision": "allow"})
-        return emit({})
+        return neutral(event)
+    if manifest.get("version") != 2:
+        return neutral(event)
+
     claimed = manifest.get("conversationId")
     current = payload.get("conversationId")
     if not claimed and current:
         manifest["conversationId"] = current
-        save(path, manifest)
+        save_json(path, manifest)
     elif claimed and current and claimed != current:
-        if sys.argv[1] == "pre-tool":
-            return emit({"decision": "allow"})
-        if sys.argv[1] == "pre-invocation":
-            return emit({"injectSteps": []})
-        if sys.argv[1] == "stop":
-            return emit({"decision": "allow"})
-        return emit({})
-    if sys.argv[1] == "pre-tool":
+        return neutral(event)
+
+    if event == "pre-tool":
         return pre_tool(path, manifest, payload)
-    if sys.argv[1] == "post-tool":
+    if event == "post-tool":
         return post_tool(path, manifest, payload)
-    if sys.argv[1] == "pre-invocation":
+    if event == "pre-invocation":
         return pre_invocation(manifest)
     return stop(path, manifest)
 

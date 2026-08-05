@@ -1,20 +1,20 @@
 # Output format
 
-Write UTF-8 Markdown. Include every page exactly once and in order:
+The Hook writes UTF-8 Markdown by concatenating immutable, per-page UTF-8 text drafts. It adds
+every page heading exactly once and in order:
 
 ```markdown
 # 전사문
 
 ## Page 1
-<faithful transcription, or [빈 페이지]>
+<literal visible lines, or [빈 페이지]>
 
 ## Page 2
 <faithful transcription>
 ```
 
-Use the literal heading `## Page N` for each one-based page number. Keep visible section titles,
-paragraphs, lists, tables, marginal notes, strike-throughs, and insertions as faithfully as
-Markdown permits. Use `[취소선: ...]` and `[삽입: ...]` where plain Markdown would hide meaning.
+Do not put a `## Page N` heading in a page draft; the Hook supplies it. Preserve physical lines,
+bullets, arrows, numbering, indentation, marginal notes, strike-throughs, and insertions. Use
+`[취소: ...]`, `[삽입: ...]`, and `[판독 불가]` only as visual annotations.
 
-Do not add a polished rewrite inside the transcript. If the user requests a summary, translation,
-or normalized copy, add it after all page sections under `# 별도 해설`.
+Do not put a rewrite, summary, evaluation, inferred answer, or explanation in a page draft.

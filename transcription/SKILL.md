@@ -1,16 +1,18 @@
 ---
 name: transcription
 description: >-
-  Scanned handwritten PDF files are transcribed page by page by visually inspecting every
-  rendered page with view_file, without OCR, PDF text extraction, invented text, or skipped
-  pages. Use this skill whenever the user asks Antigravity CLI to transcribe, decipher, or
-  type up handwritten notes, forms, manuscripts, answers, or other scanned handwriting in PDF.
+  Scanned handwritten PDF files are transcribed literally, one visible line at a time, by
+  inspecting each rendered page with view_file and immediately saving that page before viewing
+  the next. It forbids OCR, summarization, normalization, inferred or invented text, and skipped
+  pages. Use whenever the user asks Antigravity CLI to transcribe, decipher, or type up scanned
+  handwriting in PDF with exact bullets, arrows, corrections, spelling, and line structure.
 ---
 
 # Handwritten PDF transcription
 
-Transcribe only marks that are visible on the supplied scan. Never reconstruct a plausible
-document from context. Mark uncertain text explicitly instead of guessing.
+Copy only marks visible in the supplied scan. Treat this as literal visual transcription, not
+content generation. Never reconstruct a plausible answer from the printed question, surrounding
+pages, expected subject knowledge, or memory.
 
 ## One-time workspace setup
 
@@ -39,32 +41,45 @@ ordering needed for reliable completion checks.
 1. Resolve the real source PDF and requested output path. Do not create a substitute/sample PDF.
 2. Read any separate user-supplied terminology or formatting reference before starting the
    guarded session.
-3. Start a guarded session from the workspace root:
+3. Start a guarded session from the workspace root using this skill's actual installation path.
+   For the global installation, run:
 
    ```bash
-   python3 .agents/skills/transcription/scripts/transcription_session.py start \
+   python3 ~/.gemini/config/skills/transcription/scripts/transcription_session.py start \
      --pdf "/absolute/path/to/source.pdf" \
      --output "/absolute/path/to/transcript.md"
    ```
 
-   This renders each page to an image without OCR or text extraction. Rendering is only a
+   For a workspace installation, replace the script path with
+   `.agents/skills/transcription/scripts/transcription_session.py`.
+
+   If the user requests only specific source pages, add `--pages "7-8,11"`. Never select pages
+   merely to avoid difficult handwriting.
+
+   This renders each page at high resolution without OCR or text extraction. Rendering is only a
    view adapter: the agent, not a recognition program, must read the handwriting.
-4. Follow the injected hook instruction. Call `view_file` exactly once for the absolute image
-   path shown for the next page. Process pages in numerical order. Do not use `read_file`,
-   `pdftotext`, OCR, vision scripts, image-description services, or shell commands to obtain text.
-5. Immediately retain a faithful draft for that page in reasoning/context. Preserve spelling,
-   punctuation, line breaks, insertions, deletions, and visible structure when discernible.
-   Use `[판독 불가]` for unreadable spans and `[불확실: 후보1/후보2]` only when the visible marks
-   genuinely support those candidates. Never silently repair the author's language.
-6. After every page has a successful `view_file` call, write the complete transcript only to
-   the registered output path. Use the required page headings from
-   [references/output-format.md](references/output-format.md).
-7. Before answering the user, run no bypass command. Allow the Stop hook to validate page-view
-   coverage, source integrity, output existence, and page headings. If it forces continuation,
-   fix exactly the reported deficiency.
+4. Follow the injected hook instruction. Call `view_file` for the exact next page image. Process
+   pages numerically. Re-open the same image if necessary; never advance from memory.
+5. Immediately after viewing a page, use `write_to_file` on the exact page-draft path injected by
+   the Hook. No other page can be viewed first. Write visible text from top to bottom, retaining
+   the author's physical line breaks. Apply these literal rules:
+   - Preserve bullet symbols, numbering, arrows, indentation, misspellings, spacing distinctions,
+     repeated words, unfinished sentences, and punctuation as seen.
+   - Record crossed-out but legible text as `[취소: visible text]` at its original position.
+   - Record insertions as `[삽입: visible text]` at their visible position.
+   - Use `[판독 불가]`; never replace unclear writing with a contextually likely sentence.
+   - Use `[빈 페이지]` only after visually confirming that no target writing is present.
+   - Do not turn a list into prose, join separate lines, summarize, polish grammar, answer the
+     printed question, or add facts absent from the pixels.
+6. Let the Hook verify the page draft and assemble the registered output deterministically. It
+   locks the completed draft and then permits the next `view_file` call. Never edit prior pages.
+7. Do not use `read_file`, `pdftotext`, OCR, vision scripts, image-description services, or shell
+   commands to obtain text. Before answering the user, allow the Stop Hook to verify every image,
+   immutable page draft, source hash, and assembled output.
 
 ## Non-negotiable rules
 
+- Prefer a literal awkward fragment over a fluent invented sentence.
 - Treat blank pages as pages: view them and record `[빈 페이지]`.
 - Distinguish transcription from interpretation. Put any requested commentary after the literal
   transcript and label it separately.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dependency-free behavioral checks for the transcription lifecycle hook."""
+"""Dependency-free behavioral checks for literal transcription hooks."""
 
 from __future__ import annotations
 
@@ -23,19 +23,24 @@ class HookTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.workspace = Path(self.temporary.name)
         state_dir = self.workspace / ".transcription"
-        page_dir = state_dir / "sessions" / "test" / "pages"
+        session_dir = state_dir / "sessions" / "test"
+        page_dir = session_dir / "pages"
+        draft_dir = session_dir / "drafts"
         page_dir.mkdir(parents=True)
+        draft_dir.mkdir()
         self.source = self.workspace / "scan.pdf"
         self.source.write_bytes(b"%PDF-test fixture")
         self.output = self.workspace / "transcript.md"
+        self.source_numbers = [7, 11]
         self.pages = [page_dir / "page-1.png", page_dir / "page-2.png"]
+        self.drafts = [draft_dir / "page-0001.txt", draft_dir / "page-0002.txt"]
         for number, page in enumerate(self.pages, 1):
             page.write_bytes(f"page-{number}".encode())
         self.manifest_path = state_dir / "session.json"
         self.manifest_path.write_text(
             json.dumps(
                 {
-                    "version": 1,
+                    "version": 2,
                     "active": True,
                     "conversationId": None,
                     "sourcePdf": str(self.source),
@@ -44,15 +49,20 @@ class HookTest(unittest.TestCase):
                     "pageCount": 2,
                     "pages": [
                         {
-                            "number": number,
+                            "number": self.source_numbers[number - 1],
                             "imagePath": str(page),
                             "imageSha256": sha256(page),
+                            "draftPath": str(self.drafts[number - 1]),
+                            "draftSha256": None,
                             "viewed": False,
                             "viewedStepIdx": None,
+                            "transcribed": False,
+                            "transcribedStepIdx": None,
                         }
                         for number, page in enumerate(self.pages, 1)
                     ],
                     "pendingViews": {},
+                    "pendingDrafts": {},
                 }
             ),
             encoding="utf-8",
@@ -76,8 +86,8 @@ class HookTest(unittest.TestCase):
         )
         return json.loads(process.stdout)
 
-    def view(self, number: int, step: int) -> None:
-        allowed = self.call(
+    def view(self, number: int, step: int, *, error: str | None = None) -> None:
+        result = self.call(
             "pre-tool",
             stepIdx=step,
             toolCall={
@@ -85,39 +95,109 @@ class HookTest(unittest.TestCase):
                 "args": {"AbsolutePath": str(self.pages[number - 1])},
             },
         )
-        self.assertEqual("allow", allowed["decision"])
+        self.assertEqual("allow", result["decision"])
+        post_args = {"stepIdx": step}
+        if error:
+            post_args["error"] = error
+        self.assertEqual({}, self.call("post-tool", **post_args))
+
+    def transcribe(self, number: int, step: int, content: str) -> None:
+        result = self.call(
+            "pre-tool",
+            stepIdx=step,
+            toolCall={
+                "name": "write_to_file",
+                "args": {
+                    "TargetFile": str(self.drafts[number - 1]),
+                    "CodeContent": content,
+                },
+            },
+        )
+        self.assertEqual("allow", result["decision"])
+        self.drafts[number - 1].write_text(content, encoding="utf-8")
         self.assertEqual({}, self.call("post-tool", stepIdx=step))
 
-    def test_requires_order_and_successful_post_event(self) -> None:
+    def state(self) -> dict:
+        return json.loads(self.manifest_path.read_text(encoding="utf-8"))
+
+    def test_view_must_be_followed_by_immediate_page_draft(self) -> None:
+        self.view(1, 1)
         denied = self.call(
             "pre-tool",
-            stepIdx=1,
+            stepIdx=2,
             toolCall={
                 "name": "view_file",
                 "args": {"AbsolutePath": str(self.pages[1])},
             },
         )
         self.assertEqual("deny", denied["decision"])
-        self.view(1, 2)
-        state = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-        self.assertTrue(state["pages"][0]["viewed"])
-        self.assertFalse(state["pages"][1]["viewed"])
+        self.transcribe(1, 3, "• 시점: 허생전 → 3인칭\n• [판독 불가]\n")
+        self.assertTrue(self.state()["pages"][0]["transcribed"])
+        self.assertIn("• 시점: 허생전 → 3인칭", self.output.read_text(encoding="utf-8"))
+        self.view(2, 4)
 
-    def test_blocks_all_bypasses_and_early_output(self) -> None:
-        for name in ("run_command", "generate_image", "call_mcp_tool"):
-            result = self.call(
-                "pre-tool", stepIdx=1, toolCall={"name": name, "args": {}}
-            )
-            self.assertEqual("deny", result["decision"])
-        result = self.call(
+    def test_failed_view_does_not_advance(self) -> None:
+        self.view(1, 1, error="render failed")
+        self.assertFalse(self.state()["pages"][0]["viewed"])
+        denied = self.call(
             "pre-tool",
             stepIdx=2,
+            toolCall={
+                "name": "write_to_file",
+                "args": {"TargetFile": str(self.drafts[0])},
+            },
+        )
+        self.assertEqual("deny", denied["decision"])
+
+    def test_blocks_bypasses_wrong_writes_and_prior_page_edits(self) -> None:
+        self.view(1, 1)
+        for name in ("run_command", "generate_image", "call_mcp_tool"):
+            result = self.call(
+                "pre-tool", stepIdx=2, toolCall={"name": name, "args": {}}
+            )
+            self.assertEqual("deny", result["decision"])
+        wrong = self.call(
+            "pre-tool",
+            stepIdx=3,
             toolCall={
                 "name": "write_to_file",
                 "args": {"TargetFile": str(self.output)},
             },
         )
-        self.assertEqual("deny", result["decision"])
+        self.assertEqual("deny", wrong["decision"])
+        edit = self.call(
+            "pre-tool",
+            stepIdx=4,
+            toolCall={
+                "name": "replace_file_content",
+                "args": {"TargetFile": str(self.drafts[0])},
+            },
+        )
+        self.assertEqual("deny", edit["decision"])
+
+    def test_output_is_assembled_in_page_order_and_drafts_are_immutable(self) -> None:
+        self.view(1, 1)
+        self.transcribe(1, 2, "첫 줄\n- 둘째 줄")
+        self.view(2, 3)
+        self.transcribe(2, 4, "[빈 페이지]")
+        expected = (
+            "# 전사문\n\n## Page 7\n\n첫 줄\n- 둘째 줄\n\n## Page 11\n\n[빈 페이지]\n"
+        )
+        self.assertEqual(expected, self.output.read_text(encoding="utf-8"))
+        self.drafts[0].write_text("변조", encoding="utf-8")
+        result = self.call("stop")
+        self.assertEqual("continue", result["decision"])
+        self.assertIn("changed unexpectedly", result["reason"])
+
+    def test_stop_only_after_every_page_is_transcribed(self) -> None:
+        self.assertEqual("continue", self.call("stop")["decision"])
+        self.view(1, 1)
+        self.assertEqual("continue", self.call("stop")["decision"])
+        self.transcribe(1, 2, "한 줄")
+        self.view(2, 3)
+        self.transcribe(2, 4, "두 줄")
+        self.assertEqual("allow", self.call("stop")["decision"])
+        self.assertFalse(self.state()["active"])
 
     def test_does_not_block_an_unrelated_conversation(self) -> None:
         self.view(1, 1)
@@ -128,19 +208,6 @@ class HookTest(unittest.TestCase):
             toolCall={"name": "run_command", "args": {"CommandLine": "git status"}},
         )
         self.assertEqual("allow", result["decision"])
-
-    def test_stop_requires_all_pages_and_headings(self) -> None:
-        self.assertEqual("continue", self.call("stop")["decision"])
-        self.view(1, 1)
-        self.view(2, 2)
-        self.output.write_text("# 전사문\n\n## Page 1\na\n", encoding="utf-8")
-        self.assertEqual("continue", self.call("stop")["decision"])
-        self.output.write_text(
-            "# 전사문\n\n## Page 1\na\n\n## Page 2\n[빈 페이지]\n", encoding="utf-8"
-        )
-        self.assertEqual("allow", self.call("stop")["decision"])
-        state = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-        self.assertFalse(state["active"])
 
 
 if __name__ == "__main__":

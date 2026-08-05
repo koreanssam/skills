@@ -14,7 +14,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "view_file",
+        "matcher": "view_file|write_to_file",
         "hooks": [
           {
             "type": "command",
