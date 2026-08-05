@@ -52,6 +52,14 @@ class HookTest(unittest.TestCase):
                             "number": self.source_numbers[number - 1],
                             "imagePath": str(page),
                             "imageSha256": sha256(page),
+                            "viewAssets": [
+                                {
+                                    "kind": "full-page",
+                                    "path": str(page),
+                                    "sha256": sha256(page),
+                                    "viewed": False,
+                                }
+                            ],
                             "draftPath": str(self.drafts[number - 1]),
                             "draftSha256": None,
                             "viewed": False,

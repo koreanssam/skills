@@ -58,11 +58,9 @@ ordering needed for reliable completion checks.
 
    This renders each page at high resolution without OCR or text extraction. Rendering is only a
    view adapter: the agent, not a recognition program, must read the handwriting.
-4. Follow the injected hook instruction. For each source page, call `view_file` first on the full
-   page overview and then on every high-resolution vertical detail tile in order. The overview
-   preserves layout; the overlapping tiles make individual handwriting strokes large enough to
-   read literally. Do not write the draft until every required image for that page was viewed.
-   Re-open a required image if necessary; never advance from memory.
+4. Follow the injected hook instruction. For each source page, call `view_file` once on the
+   high-resolution full-page image. Read and transcribe from that complete page only. Do not crop,
+   tile, selectively enlarge, or make additional detail images. Never advance from memory.
 5. Immediately after viewing a page, use `write_to_file` on the exact page-draft path injected by
    the Hook. No other page can be viewed first. Write visible text from top to bottom, retaining
    the author's physical line breaks. Apply these literal rules:

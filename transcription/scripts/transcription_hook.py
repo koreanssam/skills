@@ -111,7 +111,7 @@ def next_page(manifest: dict[str, Any]) -> dict[str, Any] | None:
 def view_assets(page: dict[str, Any]) -> list[dict[str, Any]]:
     return page.get("viewAssets") or [
         {
-            "kind": "overview",
+            "kind": "full-page",
             "path": page["imagePath"],
             "sha256": page["imageSha256"],
             "viewed": page.get("viewed", False),
@@ -348,11 +348,11 @@ def pre_invocation(manifest: dict[str, Any]) -> int:
         page = next_page(manifest)
         if page:
             required = next_asset(page)
-            asset_index, asset = required if required else (0, view_assets(page)[0])
+            _, asset = required if required else (0, view_assets(page)[0])
             message = (
-                f"View required image {asset_index + 1}/{len(view_assets(page))} for source page "
-                f"{page['number']} now with view_file: {asset['path']}. The overview preserves "
-                "layout; detail tiles provide close-up handwriting. Do not recall or predict text."
+                f"View the high-resolution full image for source page {page['number']} now with "
+                f"view_file: {asset['path']}. Read the complete page as shown; do not crop, tile, "
+                "selectively enlarge, recall, or predict text."
             )
         else:
             message = "Every page was viewed and immediately transcribed. The output is complete."
