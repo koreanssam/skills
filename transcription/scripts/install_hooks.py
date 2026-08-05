@@ -28,19 +28,29 @@ def write_json_atomic(path: Path, value: dict) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace", type=Path, default=Path.cwd())
+    parser.add_argument(
+        "--global",
+        dest="global_install",
+        action="store_true",
+        help="install into ~/.gemini/config for all Antigravity workspaces",
+    )
     args = parser.parse_args()
 
-    workspace = args.workspace.expanduser().resolve()
     skill_dir = Path(__file__).resolve().parent.parent
-    expected = workspace / ".agents" / "skills" / "transcription"
+    if args.global_install:
+        customization_root = (Path.home() / ".gemini" / "config").resolve()
+    else:
+        workspace = args.workspace.expanduser().resolve()
+        customization_root = workspace / ".agents"
+    expected = customization_root / "skills" / "transcription"
     if skill_dir != expected:
         raise SystemExit(
-            "Install this folder at .agents/skills/transcription before installing its hook.\n"
+            "Install this folder under the selected customization root before installing its hook.\n"
             f"Expected: {expected}\nFound: {skill_dir}"
         )
 
     template = json.loads((skill_dir / "hooks.json").read_text(encoding="utf-8"))
-    hook_path = workspace / ".agents" / "hooks.json"
+    hook_path = customization_root / "hooks.json"
     if hook_path.exists():
         try:
             current = json.loads(hook_path.read_text(encoding="utf-8"))

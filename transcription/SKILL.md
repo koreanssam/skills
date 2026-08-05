@@ -17,10 +17,17 @@ document from context. Mark uncertain text explicitly instead of guessing.
 This skill's hook must be installed because Antigravity loads workspace hooks only from
 `<workspace>/.agents/hooks.json`, not from inside a skill folder.
 
-If `.agents/hooks.json` does not contain `transcription-page-verifier`, run:
+For a workspace installation, if `.agents/hooks.json` does not contain
+`transcription-page-verifier`, run:
 
 ```bash
 python3 .agents/skills/transcription/scripts/install_hooks.py --workspace .
+```
+
+For a global installation under `~/.gemini/config/skills/transcription`, run once:
+
+```bash
+python3 ~/.gemini/config/skills/transcription/scripts/install_hooks.py --global
 ```
 
 Restart Antigravity CLI after installing or changing hooks, then confirm the hook in `/hooks`.
