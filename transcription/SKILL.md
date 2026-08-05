@@ -58,8 +58,11 @@ ordering needed for reliable completion checks.
 
    This renders each page at high resolution without OCR or text extraction. Rendering is only a
    view adapter: the agent, not a recognition program, must read the handwriting.
-4. Follow the injected hook instruction. Call `view_file` for the exact next page image. Process
-   pages numerically. Re-open the same image if necessary; never advance from memory.
+4. Follow the injected hook instruction. For each source page, call `view_file` first on the full
+   page overview and then on every high-resolution vertical detail tile in order. The overview
+   preserves layout; the overlapping tiles make individual handwriting strokes large enough to
+   read literally. Do not write the draft until every required image for that page was viewed.
+   Re-open a required image if necessary; never advance from memory.
 5. Immediately after viewing a page, use `write_to_file` on the exact page-draft path injected by
    the Hook. No other page can be viewed first. Write visible text from top to bottom, retaining
    the author's physical line breaks. Apply these literal rules:
@@ -86,6 +89,8 @@ ordering needed for reliable completion checks.
 - Do not claim certainty that the scan does not support.
 - Do not deactivate, edit, bypass, or delete the session state or hook during a transcription.
 - If rendering fails or the scan is too poor to inspect, report the limitation; do not invent text.
+- Do not use `--dangerously-skip-permissions` when lifecycle enforcement is required. Antigravity
+  CLI may bypass lifecycle Hook decisions in that mode; use normal `agy` for enforced runs.
 
 For hook guarantees and limitations, see
 [references/hook-behavior.md](references/hook-behavior.md).

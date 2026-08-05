@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 from datetime import datetime, timezone
@@ -130,6 +131,69 @@ def page_number(path: Path) -> int:
     return int(match.group(1))
 
 
+def png_dimensions(path: Path) -> tuple[int, int]:
+    with path.open("rb") as stream:
+        header = stream.read(24)
+    if header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
+        raise SystemExit(f"Unexpected PNG header: {path}")
+    return struct.unpack(">II", header[16:24])
+
+
+def render_tiles(
+    pdf: Path, page: Path, page_num: int, dpi: int, tile_dir: Path
+) -> list[Path]:
+    executable = shutil.which("pdftoppm")
+    if not executable:
+        raise SystemExit("pdftoppm is required to render page detail tiles")
+    width, height = png_dimensions(page)
+    tile_height = 1200
+    overlap = 120
+    tile_dir.mkdir(parents=True, exist_ok=True)
+    tiles: list[Path] = []
+    y = 0
+    index = 1
+    while y < height:
+        current_height = min(tile_height, height - y)
+        prefix = tile_dir / f"page-{page_num:04d}-tile-{index:02d}"
+        process = subprocess.run(
+            [
+                executable,
+                "-png",
+                "-r",
+                str(dpi),
+                "-f",
+                str(page_num),
+                "-l",
+                str(page_num),
+                "-singlefile",
+                "-x",
+                "0",
+                "-y",
+                str(y),
+                "-W",
+                str(width),
+                "-H",
+                str(current_height),
+                str(pdf),
+                str(prefix),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if process.returncode:
+            raise SystemExit(f"pdftoppm tile render failed: {process.stderr.strip()}")
+        tile = prefix.with_suffix(".png")
+        if not tile.is_file():
+            raise SystemExit(f"Missing rendered detail tile: {tile}")
+        tiles.append(tile)
+        if y + current_height >= height:
+            break
+        y += tile_height - overlap
+        index += 1
+    return tiles
+
+
 def start(args: argparse.Namespace) -> int:
     workspace = args.workspace.expanduser().resolve()
     pdf = args.pdf.expanduser().resolve()
@@ -171,6 +235,16 @@ def start(args: argparse.Namespace) -> int:
             raise SystemExit(f"Rendered pages are not contiguous: {actual}")
         draft_dir = session_dir / "drafts"
         draft_dir.mkdir()
+        page_tiles = {
+            number: render_tiles(
+                pdf,
+                page,
+                number,
+                args.dpi,
+                session_dir / "tiles" / f"page-{number:04d}",
+            )
+            for number, page in zip(selected_pages, pages, strict=True)
+        }
 
         manifest = {
             "version": 2,
@@ -188,6 +262,23 @@ def start(args: argparse.Namespace) -> int:
                     "number": number,
                     "imagePath": str(page.resolve()),
                     "imageSha256": digest(page),
+                    "viewAssets": [
+                        {
+                            "kind": "overview",
+                            "path": str(page.resolve()),
+                            "sha256": digest(page),
+                            "viewed": False,
+                        },
+                        *[
+                            {
+                                "kind": f"detail-{index}",
+                                "path": str(tile.resolve()),
+                                "sha256": digest(tile),
+                                "viewed": False,
+                            }
+                            for index, tile in enumerate(page_tiles[number], 1)
+                        ],
+                    ],
                     "draftPath": str((draft_dir / f"page-{number:04d}.txt").resolve()),
                     "draftSha256": None,
                     "viewed": False,
@@ -205,7 +296,11 @@ def start(args: argparse.Namespace) -> int:
     print(f"Started guarded literal transcription: {pdf}")
     print(f"Pages: {len(pages)}")
     print(f"Output: {output}")
+    print(
+        f"Required visual views for first page: {len(manifest['pages'][0]['viewAssets'])}"
+    )
     print(f"Next view_file path: {pages[0].resolve()}")
+    print(f"After all views, exact draft path: {manifest['pages'][0]['draftPath']}")
     return 0
 
 

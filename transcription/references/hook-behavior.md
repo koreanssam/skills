@@ -2,6 +2,8 @@
 
 The Hook records a page as viewed only after a successful `view_file` call whose `AbsolutePath`
 matches the expected rendered page and whose SHA-256 digest still matches the session manifest.
+Each source page has one overview image plus overlapping high-resolution vertical detail tiles;
+all must receive successful `view_file` results before the page draft is permitted.
 It then blocks the next page and every unrelated tool until `write_to_file` creates that page's
 literal draft at the registered path. After a successful draft write, the Hook hashes the draft,
 marks it immutable, and rebuilds the output deterministically before permitting the next page.

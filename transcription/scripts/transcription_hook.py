@@ -108,6 +108,28 @@ def next_page(manifest: dict[str, Any]) -> dict[str, Any] | None:
     return next((page for page in manifest["pages"] if not page.get("viewed")), None)
 
 
+def view_assets(page: dict[str, Any]) -> list[dict[str, Any]]:
+    return page.get("viewAssets") or [
+        {
+            "kind": "overview",
+            "path": page["imagePath"],
+            "sha256": page["imageSha256"],
+            "viewed": page.get("viewed", False),
+        }
+    ]
+
+
+def next_asset(page: dict[str, Any]) -> tuple[int, dict[str, Any]] | None:
+    return next(
+        (
+            (index, asset)
+            for index, asset in enumerate(view_assets(page))
+            if not asset["viewed"]
+        ),
+        None,
+    )
+
+
 def pending_transcription(manifest: dict[str, Any]) -> dict[str, Any] | None:
     return next(
         (
@@ -168,17 +190,42 @@ def pre_tool(path: Path, manifest: dict[str, Any], payload: dict[str, Any]) -> i
                 {"decision": "deny", "reason": "Every page is already transcribed."}
             )
         requested = first_arg(args, "AbsolutePath", "path", "filePath")
-        expected = Path(page["imagePath"]).resolve()
-        if not requested or Path(requested).expanduser().resolve() != expected:
+        if pending:
+            matching = next(
+                (
+                    (index, asset)
+                    for index, asset in enumerate(view_assets(page))
+                    if requested
+                    and Path(requested).expanduser().resolve()
+                    == Path(asset["path"]).resolve()
+                ),
+                None,
+            )
+        else:
+            matching = next_asset(page)
+            if matching and requested:
+                _, asset = matching
+                if (
+                    Path(requested).expanduser().resolve()
+                    != Path(asset["path"]).resolve()
+                ):
+                    matching = None
+        if matching is None:
+            required = next_asset(page)
+            expected = Path(
+                (required[1] if required else view_assets(page)[-1])["path"]
+            ).resolve()
             action = (
                 "Re-open the current page"
                 if pending
-                else f"View page {page['number']} next"
+                else f"View the next required segment of page {page['number']}"
             )
             return emit(
                 {"decision": "deny", "reason": f"{action} with view_file: {expected}"}
             )
-        if not expected.is_file() or digest(expected) != page["imageSha256"]:
+        asset_index, asset = matching
+        expected = Path(asset["path"]).resolve()
+        if not expected.is_file() or digest(expected) != asset["sha256"]:
             return emit(
                 {
                     "decision": "deny",
@@ -189,9 +236,10 @@ def pre_tool(path: Path, manifest: dict[str, Any], payload: dict[str, Any]) -> i
             return emit(
                 {"decision": "deny", "reason": "Missing hook stepIdx for page view."}
             )
-        manifest.setdefault("pendingViews", {})[str(payload["stepIdx"])] = page[
-            "number"
-        ]
+        manifest.setdefault("pendingViews", {})[str(payload["stepIdx"])] = {
+            "pageNumber": page["number"],
+            "assetIndex": asset_index,
+        }
         save_json(path, manifest)
         return emit({"decision": "allow"})
 
@@ -250,10 +298,19 @@ def pre_tool(path: Path, manifest: dict[str, Any], payload: dict[str, Any]) -> i
 
 def post_tool(path: Path, manifest: dict[str, Any], payload: dict[str, Any]) -> int:
     step_key = str(payload.get("stepIdx"))
-    page_number = manifest.setdefault("pendingViews", {}).pop(step_key, None)
-    if page_number is not None and not payload.get("error"):
-        page = page_by_number(manifest, int(page_number))
-        page["viewed"] = True
+    view_claim = manifest.setdefault("pendingViews", {}).pop(step_key, None)
+    if view_claim is not None and not payload.get("error"):
+        if isinstance(view_claim, dict):
+            page_number = int(view_claim["pageNumber"])
+            asset_index = int(view_claim["assetIndex"])
+        else:
+            page_number = int(view_claim)
+            asset_index = 0
+        page = page_by_number(manifest, page_number)
+        assets = view_assets(page)
+        assets[asset_index]["viewed"] = True
+        page["viewAssets"] = assets
+        page["viewed"] = all(asset["viewed"] for asset in assets)
         page["viewedStepIdx"] = payload.get("stepIdx")
         page["viewedAt"] = datetime.now(timezone.utc).isoformat()
 
@@ -290,9 +347,12 @@ def pre_invocation(manifest: dict[str, Any]) -> int:
     else:
         page = next_page(manifest)
         if page:
+            required = next_asset(page)
+            asset_index, asset = required if required else (0, view_assets(page)[0])
             message = (
-                f"View page {page['number']} of {manifest['pageCount']} now with view_file: "
-                f"{page['imagePath']}. Inspect the actual pixels; do not recall or predict text."
+                f"View required image {asset_index + 1}/{len(view_assets(page))} for source page "
+                f"{page['number']} now with view_file: {asset['path']}. The overview preserves "
+                "layout; detail tiles provide close-up handwriting. Do not recall or predict text."
             )
         else:
             message = "Every page was viewed and immediately transcribed. The output is complete."
@@ -328,14 +388,18 @@ def stop(path: Path, manifest: dict[str, Any]) -> int:
             }
         )
     for page in manifest["pages"]:
-        image_path = Path(page["imagePath"])
-        if not image_path.is_file() or digest(image_path) != page["imageSha256"]:
-            return emit(
-                {
-                    "decision": "continue",
-                    "reason": f"Rendered image for page {page['number']} changed unexpectedly.",
-                }
-            )
+        for asset in view_assets(page):
+            image_path = Path(asset["path"])
+            if not image_path.is_file() or digest(image_path) != asset["sha256"]:
+                return emit(
+                    {
+                        "decision": "continue",
+                        "reason": (
+                            f"Rendered {asset['kind']} image for page {page['number']} "
+                            "changed unexpectedly."
+                        ),
+                    }
+                )
         draft = Path(page["draftPath"])
         if not draft.is_file() or digest(draft) != page.get("draftSha256"):
             return emit(
